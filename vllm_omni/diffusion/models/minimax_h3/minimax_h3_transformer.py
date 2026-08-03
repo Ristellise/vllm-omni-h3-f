@@ -460,7 +460,7 @@ class MiniMaxH3Attention(nn.Module):
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
         base_loader = self.qkv_proj.weight.weight_loader
 
-        def _weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        def _weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor, *args, **kwargs) -> None:
             # The grouped checkpoint layout is
             # [num_query_groups, q_per_group + k + v] before splitting.
             # MiniMax H3 uses MHA, so checkpoint rows are per-head [q, k, v],
@@ -471,7 +471,7 @@ class MiniMaxH3Attention(nn.Module):
                 heads_per_group=1,
                 head_dim=arch.attention_head_dim,
             )
-            base_loader(param, reordered)
+            base_loader(param, reordered, *args, **kwargs)
 
         self.qkv_proj.weight.weight_loader = _weight_loader
 
