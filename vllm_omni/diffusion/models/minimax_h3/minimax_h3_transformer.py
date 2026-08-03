@@ -481,20 +481,37 @@ class MiniMaxH3Attention(nn.Module):
         returns bf16 output. The fmha_v3 fp8 ASM kernel (fwd_hd128_fp8.co)
         is used on gfx942. No weight changes — pure activation quantization.
         """
+        # H3's cu_seqlens is [0, used, seq_len] — a real document followed by
+        # an alignment-padding document that may be empty. aiter's
+        # _quantize_thd iterates per-segment and calls amax, which crashes on
+        # a zero-length segment. Slice to the used tokens and use a single
+        # segment so the quantizer never sees the padding.
+        used = int(cu_seqlens[1].item())
+        q_real = q[:used]
+        k_real = k[:used]
+        v_real = v[:used]
+        cu_single = cu_seqlens[:2]
         out = _flash_attn_varlen_fp8_func(
-            q,
-            k,
-            v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
+            q_real,
+            k_real,
+            v_real,
+            cu_seqlens_q=cu_single,
+            cu_seqlens_k=cu_single,
+            max_seqlen_q=used,
+            max_seqlen_k=used,
             softmax_scale=self.softmax_scale,
             causal=False,
         )
         # flash_attn_varlen_fp8_func returns fp32; cast back to bf16 to match
         # the bf16 output the DiT block expects from the attention layer.
-        return out.to(q.dtype)
+        # Re-pad to the full sequence length so the output projection sees the
+        # same shape it gets from the bf16 path.
+        out_bf16 = out.to(q.dtype)
+        if used < q.shape[0]:
+            out_full = torch.zeros_like(q)
+            out_full[:used] = out_bf16
+            return out_full
+        return out_bf16
 
     def forward(
         self,
