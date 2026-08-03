@@ -361,6 +361,13 @@ class MiniMaxH3Attention(nn.Module):
             causal=False,
             skip_sequence_parallel=skip_sequence_parallel,
         )
+        # Cache the packed-attention metadata derived from ``cu_seqlens``.
+        # ``cu_seqlens`` is constant across all 50 layers and all 49 denoise
+        # steps (it lives in ``MiniMaxH3DenoiseBranch.static_kwargs``), so the
+        # ``.item()`` syncs and the (dead-on-FA-path) ``attn_mask`` allocation
+        # only need to run once per layer. Keyed by ``data_ptr()`` so a new
+        # request with a new tensor misses and recomputes.
+        self._packed_attn_cache: dict[int, torch.Tensor | None] = {}
 
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
         base_loader = self.qkv_proj.weight.weight_loader
@@ -397,11 +404,19 @@ class MiniMaxH3Attention(nn.Module):
         regional compile fuse projections, norms, RoPE, and the surrounding
         DiT block without repeatedly graph-breaking inside the FA4 compiler.
         """
-        used = int(cu_seqlens[1].item())
-        packed_total = int(cu_seqlens[-1].item())
-        attn_mask = None
-        if used < packed_total:
-            attn_mask = torch.arange(packed_total, device=q.device)[None] < used
+        # ``cu_seqlens`` is constant across layers and denoise steps, so the
+        # GPU→CPU syncs (``.item()``) and the ``attn_mask`` allocation only need
+        # to run once per layer. The mask is dead on the FlashAttention packed
+        # path (``cu_seqlens`` segments the documents) but is kept for the SDPA
+        # fp32 fallback; caching it avoids re-allocating per step.
+        key = cu_seqlens.data_ptr()
+        attn_mask = self._packed_attn_cache.get(key)
+        if attn_mask is None and key not in self._packed_attn_cache:
+            used = int(cu_seqlens[1].item())
+            packed_total = int(cu_seqlens[-1].item())
+            if used < packed_total:
+                attn_mask = torch.arange(packed_total, device=q.device)[None] < used
+            self._packed_attn_cache[key] = attn_mask
         metadata = AttentionMetadata(
             attn_mask=attn_mask,
             extra={
