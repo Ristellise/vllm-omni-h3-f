@@ -963,20 +963,69 @@ class MiniMaxH3Pipeline(
             shift_scale=audio_shift,
         )
         with self.progress_bar(total=len(video_sigmas) - 1) as progress:
-            video_rows, audio_rows = minimax_h3_denoise_loop(
-                model=self.transformer,
-                positive=branch,
-                initial_video_rows=initial_video,
-                initial_audio_rows=initial_audio,
-                keyframe_cond_rows=visual_anchor,
-                audio_ref_rows=audio_anchor,
-                sigmas_video=video_sigmas,
-                sigmas_audio=audio_sigmas,
-                device=self.device,
-                imgvid_cond_noise_aug_for_inference=(MINIMAX_H3_IMGVID_COND_TIMESTEP),
-                audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
-                on_step=lambda step, video, audio: progress.update(),
-            )
+            _h3_profile = os.environ.get("H3_PROFILE_STEPS")
+            if _h3_profile:
+                from contextlib import contextmanager
+
+                from torch.profiler import (
+                    ProfilerActivity,
+                    profile,
+                    schedule,
+                )
+
+                _prof = profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                    schedule=schedule(wait=1, warmup=2, active=3, repeat=1),
+                    record_shapes=True,
+                    with_stack=True,
+                )
+                _prof.start()
+
+                @contextmanager
+                def _step_profiler(step):
+                    yield
+                    _prof.step()
+
+                logger.info("H3 profiling enabled: wait=1 warmup=2 active=3")
+                video_rows, audio_rows = minimax_h3_denoise_loop(
+                    model=self.transformer,
+                    positive=branch,
+                    initial_video_rows=initial_video,
+                    initial_audio_rows=initial_audio,
+                    keyframe_cond_rows=visual_anchor,
+                    audio_ref_rows=audio_anchor,
+                    sigmas_video=video_sigmas,
+                    sigmas_audio=audio_sigmas,
+                    device=self.device,
+                    imgvid_cond_noise_aug_for_inference=(MINIMAX_H3_IMGVID_COND_TIMESTEP),
+                    audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
+                    on_step=lambda step, video, audio: progress.update(),
+                    step_profiler=_step_profiler,
+                )
+                _prof.stop()
+                _prof.export_chrome_trace("/tmp/h3_trace.json")
+                _prof.export_stacks("/tmp/h3_stacks.txt", "self_cuda_time_total")
+                logger.info(
+                    "H3 profile: trace=/tmp/h3_trace.json stacks=/tmp/h3_stacks.txt\n%s",
+                    _prof.key_averages().table(
+                        sort_by="cuda_time_total", row_limit=30
+                    ),
+                )
+            else:
+                video_rows, audio_rows = minimax_h3_denoise_loop(
+                    model=self.transformer,
+                    positive=branch,
+                    initial_video_rows=initial_video,
+                    initial_audio_rows=initial_audio,
+                    keyframe_cond_rows=visual_anchor,
+                    audio_ref_rows=audio_anchor,
+                    sigmas_video=video_sigmas,
+                    sigmas_audio=audio_sigmas,
+                    device=self.device,
+                    imgvid_cond_noise_aug_for_inference=(MINIMAX_H3_IMGVID_COND_TIMESTEP),
+                    audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
+                    on_step=lambda step, video, audio: progress.update(),
+                )
 
         target_video = video_rows[branch.update_mask_dev]
         video_latent = minimax_h3_unpatchify_video_tokens(
