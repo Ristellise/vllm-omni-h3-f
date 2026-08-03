@@ -609,15 +609,21 @@ class MiniMaxH3MLP(nn.Module):
     def _install_fc1_weight_loader(self) -> None:
         base_loader = self.fc1.weight.weight_loader
 
-        def _weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        def _unwrap_layerwise(loader):
+            while getattr(loader, "__name__", "") == "online_process_loader":
+                loader = loader.__wrapped__
+            return loader
+
+        def _weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor, *args, **kwargs) -> None:
             if loaded_weight.shape[0] % 2:
                 raise ValueError(
                     "MiniMax H3 fc1 checkpoint rows must split evenly into "
                     f"gate/up matrices, got {tuple(loaded_weight.shape)}"
                 )
             gate, up = loaded_weight.chunk(2, dim=0)
-            base_loader(param, gate, 0)
-            base_loader(param, up, 1)
+            loader = _unwrap_layerwise(base_loader)
+            loader(param, gate, 0, *args, **kwargs)
+            loader(param, up, 1, *args, **kwargs)
 
         self.fc1.weight.weight_loader = _weight_loader
 
