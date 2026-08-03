@@ -460,6 +460,15 @@ class MiniMaxH3Attention(nn.Module):
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
         base_loader = self.qkv_proj.weight.weight_loader
 
+        def _unwrap_layerwise(loader):
+            # vLLM's layerwise offload wraps weight loaders in
+            # ``online_process_loader``. Calling the wrapped loader from inside
+            # our wrapper would recurse (wrapper -> base -> wrapper -> ...).
+            # Unwrap to the original loader before delegating.
+            while getattr(loader, "__name__", "") == "online_process_loader":
+                loader = loader.__wrapped__
+            return loader
+
         def _weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor, *args, **kwargs) -> None:
             # The grouped checkpoint layout is
             # [num_query_groups, q_per_group + k + v] before splitting.
@@ -471,7 +480,7 @@ class MiniMaxH3Attention(nn.Module):
                 heads_per_group=1,
                 head_dim=arch.attention_head_dim,
             )
-            base_loader(param, reordered, *args, **kwargs)
+            _unwrap_layerwise(base_loader)(param, reordered, *args, **kwargs)
 
         self.qkv_proj.weight.weight_loader = _weight_loader
 
