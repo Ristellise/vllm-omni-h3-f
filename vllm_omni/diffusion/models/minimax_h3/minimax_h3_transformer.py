@@ -9,6 +9,7 @@ layout.
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -104,6 +105,28 @@ MINIMAX_H3_FP32_BUFFER_NAMES = frozenset({"rope.inv_freq"})
 # video/text/audio tokens (padding is clamped to 0 before the embedding
 # lookup and masked out afterwards).
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
+
+# FP8 attention: when H3_FP8_ATTN=1, quantize Q/K/V to fp8 on-the-fly and
+# use aiter's fmha_v3 fp8 kernel. Weights stay bf16 — pure activation
+# quantization. Lazy-imported on first use to avoid hard-depending on aiter
+# when the flag is unset.
+_USE_FP8_ATTN = os.environ.get("H3_FP8_ATTN", "") == "1"
+_flash_attn_varlen_fp8_func = None
+
+
+def _get_fp8_attn_func():
+    global _flash_attn_varlen_fp8_func
+    if _flash_attn_varlen_fp8_func is None:
+        from aiter.ops.triton.attention.mha_v3 import flash_attn_varlen_fp8_func
+
+        _flash_attn_varlen_fp8_func = flash_attn_varlen_fp8_func
+    return _flash_attn_varlen_fp8_func
+
+
+# Resolve eagerly so the flag is checked at import time but the import is
+# deferred to first call (runs on the GPU node, not at module load).
+if _USE_FP8_ATTN:
+    _get_fp8_attn_func()
 
 
 def _required_kwarg(kwargs: dict[str, Any], key: str) -> Any:
@@ -404,6 +427,15 @@ class MiniMaxH3Attention(nn.Module):
         regional compile fuse projections, norms, RoPE, and the surrounding
         DiT block without repeatedly graph-breaking inside the FA4 compiler.
         """
+        # FP8 attention fast path: quantize Q/K/V to fp8 on-the-fly and use
+        # the aiter fmha_v3 fp8 kernel. The weights stay bf16 — only the
+        # attention activations are quantized dynamically per forward. Gated
+        # by H3_FP8_ATTN=1 so we can A/B against bf16.
+        if _USE_FP8_ATTN:
+            return self._run_packed_attention_fp8(
+                q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+            )
+
         # ``cu_seqlens`` is constant across layers and denoise steps, so the
         # GPU→CPU syncs (``.item()``) and the ``attn_mask`` allocation only need
         # to run once per layer. The mask is dead on the FlashAttention packed
@@ -432,6 +464,37 @@ class MiniMaxH3Attention(nn.Module):
             v.unsqueeze(0),
             metadata,
         ).squeeze(0)
+
+    @torch.compiler.disable
+    def _run_packed_attention_fp8(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        """FP8 packed attention via aiter's flash_attn_varlen_fp8_func.
+
+        Takes bf16 Q/K/V in THD layout, quantizes to fp8 internally, and
+        returns bf16 output. The fmha_v3 fp8 ASM kernel (fwd_hd128_fp8.co)
+        is used on gfx942. No weight changes — pure activation quantization.
+        """
+        out = _flash_attn_varlen_fp8_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            softmax_scale=self.softmax_scale,
+            causal=False,
+        )
+        # flash_attn_varlen_fp8_func returns fp32; cast back to bf16 to match
+        # the bf16 output the DiT block expects from the attention layer.
+        return out.to(q.dtype)
 
     def forward(
         self,
