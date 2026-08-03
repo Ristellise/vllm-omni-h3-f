@@ -904,6 +904,13 @@ class MiniMaxH3DiTModel(nn.Module):
         self.sp_prepare = MiniMaxH3SPPrepare()
         self.sp_gather = MiniMaxH3SPGather()
         self.final_layer = MiniMaxH3FinalLayer(arch, quant_config)
+        # Cache for the step-invariant token-refiner output. ``prompt_embeds``
+        # is constant across all 49 denoise steps (it lives in
+        # ``MiniMaxH3DenoiseBranch.static_kwargs``), so ``condition_proj`` +
+        # ``token_refiner`` only need to run once per request. Keyed by
+        # ``(data_ptr, shape, dtype)`` of the source tensor so a new request
+        # with a different tensor misses and recomputes.
+        self._refined_text_cache: tuple[tuple, torch.Tensor] | None = None
         self._mark_missing_params_required()
 
     def _mark_missing_params_required(self) -> None:
@@ -982,13 +989,25 @@ class MiniMaxH3DiTModel(nn.Module):
         audio_rows = audio_x.view(-1, audio_x.shape[-1]).index_select(0, audio_pos).to(_FP32_DTYPE)
         audio_embed, _ = self.audio_patch_proj(audio_rows)
 
-        text_rows = text_embeddings_selected.to(device=device, dtype=_BF16_DTYPE)
-        text_embed, _ = self.condition_proj(text_rows)
-        text_embed = self.token_refiner(
-            text_embed,
-            cu_seqlens=refiner_cu_seqlens,
-            max_seqlen=refiner_max_seqlen,
+        # ``text_embeddings_selected`` (``prompt_embeds``) is constant across
+        # all 49 denoise steps, so the ``condition_proj`` + ``token_refiner``
+        # output is step-invariant. Compute once per request and reuse.
+        cache_key = (
+            text_embeddings_selected.data_ptr(),
+            tuple(text_embeddings_selected.shape),
+            text_embeddings_selected.dtype,
         )
+        if self._refined_text_cache is not None and self._refined_text_cache[0] == cache_key:
+            text_embed = self._refined_text_cache[1]
+        else:
+            text_rows = text_embeddings_selected.to(device=device, dtype=_BF16_DTYPE)
+            text_embed, _ = self.condition_proj(text_rows)
+            text_embed = self.token_refiner(
+                text_embed,
+                cu_seqlens=refiner_cu_seqlens,
+                max_seqlen=refiner_max_seqlen,
+            )
+            self._refined_text_cache = (cache_key, text_embed)
 
         embeddings = torch.zeros((seq_len, self.hidden_size), device=device, dtype=_BF16_DTYPE)
         embeddings.index_add_(0, text_pos, text_embed.to(_BF16_DTYPE)[: text_pos.shape[0]])
