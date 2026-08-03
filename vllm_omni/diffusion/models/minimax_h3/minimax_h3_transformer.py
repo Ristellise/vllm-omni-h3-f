@@ -117,12 +117,12 @@ _flash_attn_varlen_fp8_func = None
 def _get_fp8_attn_func():
     global _flash_attn_varlen_fp8_func
     if _flash_attn_varlen_fp8_func is None:
-        from aiter import flash_attn_varlen_func as _aiter_flash_attn_varlen_func
+        from aiter.ops.mha import _flash_attn_varlen_forward
         from aiter.ops.triton.attention.mha_v3 import _quantize_thd
         from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
         _flash_attn_varlen_fp8_func = (
-            _aiter_flash_attn_varlen_func,
+            _flash_attn_varlen_forward,
             _quantize_thd,
             get_fp8_e4m3_dtype(),
         )
@@ -512,14 +512,18 @@ class MiniMaxH3Attention(nn.Module):
         k_fp8, k_descale = quantize_thd(k_real, fp8_dtype, cu_single)
         v_fp8, v_descale = quantize_thd(v_real, fp8_dtype, cu_single)
 
-        out = flash_attn_varlen(
+        out, _, _, _ = flash_attn_varlen(
             q_fp8,
             k_fp8,
             v_fp8,
             cu_seqlens_q=cu_single,
             cu_seqlens_k=cu_single,
+            cu_seqlens_q_padded=None,
+            cu_seqlens_k_padded=None,
             max_seqlen_q=used,
             max_seqlen_k=used,
+            min_seqlen_q=0,
+            dropout_p=0.0,
             softmax_scale=self.softmax_scale,
             causal=False,
             q_descale=q_descale,
