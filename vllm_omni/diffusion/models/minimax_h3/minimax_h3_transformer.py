@@ -107,32 +107,91 @@ MINIMAX_H3_FP32_BUFFER_NAMES = frozenset({"rope.inv_freq"})
 MINIMAX_H3_ADALN_MODALITY_NUM = 3
 
 # FP8 attention: when H3_FP8_ATTN=1, quantize Q/K/V to fp8 on-the-fly and
-# use aiter's fmha_v3 fp8 kernel. Weights stay bf16 — pure activation
-# quantization. Lazy-imported on first use to avoid hard-depending on aiter
-# when the flag is unset.
+# use aiter's fmha_v3 fp8 ASM kernel. Weights stay bf16 — pure activation
+# quantization.
+#
+# Implementation: monkey-patch the ``flash_attn_varlen_func`` symbol in the
+# attention backend's FA utils module with an FP8 wrapper. This way the
+# entire attention layer (including Ulysses sequence-parallel all-to-all)
+# runs unchanged — only the kernel call is swapped to the fp8 path. Works
+# transparently for both 1-GPU and multi-GPU Ulysses configs.
 _USE_FP8_ATTN = os.environ.get("H3_FP8_ATTN", "") == "1"
-_flash_attn_varlen_fp8_func = None
 
 
-def _get_fp8_attn_func():
-    global _flash_attn_varlen_fp8_func
-    if _flash_attn_varlen_fp8_func is None:
-        from aiter.ops.mha import _flash_attn_varlen_forward
-        from aiter.ops.triton.attention.mha_v3 import _quantize_thd
-        from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+def _install_fp8_attention_patch() -> None:
+    """Patch fa.flash_attn_varlen_func with an FP8 wrapper."""
+    from aiter.ops.mha import _flash_attn_varlen_forward
+    from aiter.ops.triton.attention.mha_v3 import _quantize_thd
+    from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
+    from vllm_omni.diffusion.attention.backends.utils import fa as _fa_module
 
-        _flash_attn_varlen_fp8_func = (
-            _flash_attn_varlen_forward,
-            _quantize_thd,
-            get_fp8_e4m3_dtype(),
+    fp8_dtype = get_fp8_e4m3_dtype()
+    _orig_func = _fa_module.flash_attn_varlen_func
+
+    def _fp8_flash_attn_varlen(
+        q,
+        k,
+        v,
+        *,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=False,
+        softmax_scale=None,
+        **kwargs,
+    ):
+        # H3's cu_seqlens is [0, used, seq_len] — a real document followed by
+        # an alignment-padding document that may be empty. aiter's
+        # _quantize_thd iterates per-segment and calls amax, which crashes on
+        # a zero-length segment. Slice to the used tokens (first segment) and
+        # use a single-segment cu_seqlens so the quantizer never sees padding.
+        used = int(cu_seqlens_q[1].item())
+        cu_single = cu_seqlens_q[:2]
+        q_real = q[:used]
+        k_real = k[:used]
+        v_real = v[:used]
+
+        # Dynamic per-tensor quantization to fp8. _quantize_thd returns
+        # descale of shape (batch_size, num_heads) which matches the ASM
+        # kernel's (batch_size, nhead_k) requirement for MHA.
+        q_fp8, q_descale = _quantize_thd(q_real, fp8_dtype, cu_single)
+        k_fp8, k_descale = _quantize_thd(k_real, fp8_dtype, cu_single)
+        v_fp8, v_descale = _quantize_thd(v_real, fp8_dtype, cu_single)
+
+        out, _, _, _ = _flash_attn_varlen_forward(
+            q_fp8,
+            k_fp8,
+            v_fp8,
+            cu_seqlens_q=cu_single,
+            cu_seqlens_k=cu_single,
+            cu_seqlens_q_padded=None,
+            cu_seqlens_k_padded=None,
+            max_seqlen_q=used,
+            max_seqlen_k=used,
+            min_seqlen_q=0,
+            dropout_p=0.0,
+            softmax_scale=softmax_scale if softmax_scale is not None else 1.0,
+            causal=causal,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
-    return _flash_attn_varlen_fp8_func
+        # Output is bf16 from the ASM kernel. Re-pad to the full sequence
+        # length so the output projection sees the same shape as the bf16 path.
+        if used < q.shape[0]:
+            out_full = torch.zeros_like(q)
+            out_full[:used] = out
+            return out_full
+        return out
+
+    # Preserve the original for fallback / inspection.
+    _fp8_flash_attn_varlen._orig = _orig_func  # type: ignore[attr-defined]
+    _fa_module.flash_attn_varlen_func = _fp8_flash_attn_varlen
 
 
-# Resolve eagerly so the flag is checked at import time but the import is
-# deferred to first call (runs on the GPU node, not at module load).
 if _USE_FP8_ATTN:
-    _get_fp8_attn_func()
+    _install_fp8_attention_patch()
 
 
 def _required_kwarg(kwargs: dict[str, Any], key: str) -> Any:
@@ -433,15 +492,6 @@ class MiniMaxH3Attention(nn.Module):
         regional compile fuse projections, norms, RoPE, and the surrounding
         DiT block without repeatedly graph-breaking inside the FA4 compiler.
         """
-        # FP8 attention fast path: quantize Q/K/V to fp8 on-the-fly and use
-        # the aiter fmha_v3 fp8 kernel. The weights stay bf16 — only the
-        # attention activations are quantized dynamically per forward. Gated
-        # by H3_FP8_ATTN=1 so we can A/B against bf16.
-        if _USE_FP8_ATTN:
-            return self._run_packed_attention_fp8(
-                q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
-            )
-
         # ``cu_seqlens`` is constant across layers and denoise steps, so the
         # GPU→CPU syncs (``.item()``) and the ``attn_mask`` allocation only need
         # to run once per layer. The mask is dead on the FlashAttention packed
@@ -470,73 +520,6 @@ class MiniMaxH3Attention(nn.Module):
             v.unsqueeze(0),
             metadata,
         ).squeeze(0)
-
-    @torch.compiler.disable
-    def _run_packed_attention_fp8(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        *,
-        cu_seqlens: torch.Tensor,
-        max_seqlen: int,
-    ) -> torch.Tensor:
-        """FP8 packed attention via aiter's ASM fmha_v3_varlen_fwd kernel.
-
-        Manually quantizes bf16 Q/K/V to fp8 (dynamic per-tensor) using
-        aiter's _quantize_thd, then calls flash_attn_varlen_func with the
-        fp8 tensors + descales. This routes to the hand-written gfx942 ASM
-        kernel (fwd_hd128_fp8.co) via the is_fmha_v3_fp8() dispatch check,
-        which is faster than the Triton fp8 path used by
-        flash_attn_varlen_fp8_func.
-
-        No weight changes — pure activation quantization.
-        """
-        flash_attn_varlen, quantize_thd, fp8_dtype = _get_fp8_attn_func()
-
-        # H3's cu_seqlens is [0, used, seq_len] — a real document followed by
-        # an alignment-padding document that may be empty. aiter's
-        # _quantize_thd iterates per-segment and calls amax, which crashes on
-        # a zero-length segment. Slice to the used tokens and use a single
-        # segment so the quantizer never sees the padding.
-        used = int(cu_seqlens[1].item())
-        cu_single = cu_seqlens[:2]
-        q_real = q[:used]
-        k_real = k[:used]
-        v_real = v[:used]
-
-        # Dynamic per-tensor quantization to fp8. _quantize_thd returns
-        # descale of shape (batch_size, num_heads) which matches the ASM
-        # kernel's (batch_size, nhead_k) requirement for MHA.
-        q_fp8, q_descale = quantize_thd(q_real, fp8_dtype, cu_single)
-        k_fp8, k_descale = quantize_thd(k_real, fp8_dtype, cu_single)
-        v_fp8, v_descale = quantize_thd(v_real, fp8_dtype, cu_single)
-
-        out, _, _, _ = flash_attn_varlen(
-            q_fp8,
-            k_fp8,
-            v_fp8,
-            cu_seqlens_q=cu_single,
-            cu_seqlens_k=cu_single,
-            cu_seqlens_q_padded=None,
-            cu_seqlens_k_padded=None,
-            max_seqlen_q=used,
-            max_seqlen_k=used,
-            min_seqlen_q=0,
-            dropout_p=0.0,
-            softmax_scale=self.softmax_scale,
-            causal=False,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-        )
-        # Output is bf16 from the ASM kernel. Re-pad to the full sequence
-        # length so the output projection sees the same shape as the bf16 path.
-        if used < q.shape[0]:
-            out_full = torch.zeros_like(q)
-            out_full[:used] = out
-            return out_full
-        return out
 
     def forward(
         self,
