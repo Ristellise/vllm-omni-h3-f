@@ -87,6 +87,27 @@ class MiniMaxH3DenoiseBranch:
                 "max_seqlen_q": text_len,
             },
         }
+        # Precompute timestep group assignment. The packed sequence has 4
+        # position groups with distinct per-step timesteps:
+        #   0 = text/padding + video target  (value: t_video)
+        #   1 = video condition              (value: imgvid_cond_timestep)
+        #   2 = audio target                 (value: t_audio)
+        #   3 = audio reference              (value: audio_ref_cond_timestep)
+        # The group assignment is constant across all 49 denoise steps; only
+        # the values change. This lets us replace the per-step torch.unique
+        # (which sorts the full [seq_len] tensor and forces a GPU sync) with a
+        # tiny CPU sort of <=4 values + a gather from this precomputed tensor.
+        group_id = torch.zeros(self.seq_len, dtype=torch.long, device=device)
+        group_id[self.img_pos_dev[~self.update_mask_dev]] = 1
+        group_id[self.audio_pos_dev[self.audio_update_mask_dev]] = 2
+        group_id[self.audio_pos_dev[~self.audio_update_mask_dev]] = 3
+        self._timestep_group_id = group_id
+        self._timestep_group_present = (
+            True,  # group 0: text/padding + video target (always present)
+            bool((~self.update_mask).any()),  # group 1: video condition
+            bool(self.audio_update_mask.any()),  # group 2: audio target
+            bool((~self.audio_update_mask).any()),  # group 3: audio reference
+        )
 
     def forward_kwargs(
         self,
@@ -102,21 +123,28 @@ class MiniMaxH3DenoiseBranch:
         x[0].index_copy_(0, self.img_pos_dev, video_rows)
         audio_x = self.audio_x_base.clone()
         audio_x[0].index_copy_(0, self.audio_pos_dev, audio_rows)
-        # Packed-sequence timestep semantics: non-media rows (text and
-        # padding) inherit the current video timestep. Later steps must reuse
-        # the previous step's updated rows; re-initializing from zeros is only
-        # valid at step 0.
-        timesteps = torch.full(
-            (self.seq_len,),
-            float(t_video),
-            dtype=torch.float32,
-            device=x.device,
+        # Build unique_timesteps and inverse_indices without torch.unique.
+        # The per-position group assignment is precomputed in
+        # _timestep_group_id; only the 4 group values change per step. Sort
+        # them on CPU and gather — avoids sorting the full [seq_len] tensor
+        # and the data-dependent GPU sync that torch.unique forces.
+        vals = (t_video, imgvid_cond_timestep, t_audio, audio_ref_cond_timestep)
+        present = self._timestep_group_present
+        pairs = sorted(
+            ((vals[g], g) for g in range(4) if present[g]),
+            key=lambda p: p[0],
         )
-        timesteps[self.img_pos_dev[self.update_mask_dev]] = t_video
-        timesteps[self.img_pos_dev[~self.update_mask_dev]] = imgvid_cond_timestep
-        timesteps[self.audio_pos_dev[self.audio_update_mask_dev]] = t_audio
-        timesteps[self.audio_pos_dev[~self.audio_update_mask_dev]] = audio_ref_cond_timestep
-        unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
+        unique_vals: list[float] = []
+        group_to_idx = [0, 0, 0, 0]
+        for val, g in pairs:
+            if not unique_vals or val != unique_vals[-1]:
+                unique_vals.append(val)
+            group_to_idx[g] = len(unique_vals) - 1
+        unique_timesteps = torch.tensor(
+            unique_vals, dtype=torch.float32, device=x.device
+        )
+        lookup = torch.tensor(group_to_idx, dtype=torch.long, device=x.device)
+        inverse_indices = lookup[self._timestep_group_id]
         return {
             **self.static_kwargs,
             "x": x,
