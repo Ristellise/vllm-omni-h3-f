@@ -117,9 +117,15 @@ _flash_attn_varlen_fp8_func = None
 def _get_fp8_attn_func():
     global _flash_attn_varlen_fp8_func
     if _flash_attn_varlen_fp8_func is None:
-        from aiter.ops.triton.attention.mha_v3 import flash_attn_varlen_fp8_func
+        from aiter import flash_attn_varlen_func as _aiter_flash_attn_varlen_func
+        from aiter.ops.triton.attention.mha_v3 import _quantize_thd
+        from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
-        _flash_attn_varlen_fp8_func = flash_attn_varlen_fp8_func
+        _flash_attn_varlen_fp8_func = (
+            _aiter_flash_attn_varlen_func,
+            _quantize_thd,
+            get_fp8_e4m3_dtype(),
+        )
     return _flash_attn_varlen_fp8_func
 
 
@@ -475,43 +481,58 @@ class MiniMaxH3Attention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
-        """FP8 packed attention via aiter's flash_attn_varlen_fp8_func.
+        """FP8 packed attention via aiter's ASM fmha_v3_varlen_fwd kernel.
 
-        Takes bf16 Q/K/V in THD layout, quantizes to fp8 internally, and
-        returns bf16 output. The fmha_v3 fp8 ASM kernel (fwd_hd128_fp8.co)
-        is used on gfx942. No weight changes — pure activation quantization.
+        Manually quantizes bf16 Q/K/V to fp8 (dynamic per-tensor) using
+        aiter's _quantize_thd, then calls flash_attn_varlen_func with the
+        fp8 tensors + descales. This routes to the hand-written gfx942 ASM
+        kernel (fwd_hd128_fp8.co) via the is_fmha_v3_fp8() dispatch check,
+        which is faster than the Triton fp8 path used by
+        flash_attn_varlen_fp8_func.
+
+        No weight changes — pure activation quantization.
         """
+        flash_attn_varlen, quantize_thd, fp8_dtype = _get_fp8_attn_func()
+
         # H3's cu_seqlens is [0, used, seq_len] — a real document followed by
         # an alignment-padding document that may be empty. aiter's
         # _quantize_thd iterates per-segment and calls amax, which crashes on
         # a zero-length segment. Slice to the used tokens and use a single
         # segment so the quantizer never sees the padding.
         used = int(cu_seqlens[1].item())
+        cu_single = cu_seqlens[:2]
         q_real = q[:used]
         k_real = k[:used]
         v_real = v[:used]
-        cu_single = cu_seqlens[:2]
-        out = _flash_attn_varlen_fp8_func(
-            q_real,
-            k_real,
-            v_real,
+
+        # Dynamic per-tensor quantization to fp8. _quantize_thd returns
+        # descale of shape (batch_size, num_heads) which matches the ASM
+        # kernel's (batch_size, nhead_k) requirement for MHA.
+        q_fp8, q_descale = quantize_thd(q_real, fp8_dtype, cu_single)
+        k_fp8, k_descale = quantize_thd(k_real, fp8_dtype, cu_single)
+        v_fp8, v_descale = quantize_thd(v_real, fp8_dtype, cu_single)
+
+        out = flash_attn_varlen(
+            q_fp8,
+            k_fp8,
+            v_fp8,
             cu_seqlens_q=cu_single,
             cu_seqlens_k=cu_single,
             max_seqlen_q=used,
             max_seqlen_k=used,
             softmax_scale=self.softmax_scale,
             causal=False,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
-        # flash_attn_varlen_fp8_func returns fp32; cast back to bf16 to match
-        # the bf16 output the DiT block expects from the attention layer.
-        # Re-pad to the full sequence length so the output projection sees the
-        # same shape it gets from the bf16 path.
-        out_bf16 = out.to(q.dtype)
+        # Output is bf16 from the ASM kernel. Re-pad to the full sequence
+        # length so the output projection sees the same shape as the bf16 path.
         if used < q.shape[0]:
             out_full = torch.zeros_like(q)
-            out_full[:used] = out_bf16
+            out_full[:used] = out
             return out_full
-        return out_bf16
+        return out
 
     def forward(
         self,
